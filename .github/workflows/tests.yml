@@ -58,11 +58,6 @@ jobs:
         run: |
           export PATH=$HOME/bin:$PATH
 
-          rest-server --help
-          gox --help
-          calens --help
-          minio --help
-
           go run build.go --goos linux
           go run build.go --goos windows
           go run build.go --goos darwin
