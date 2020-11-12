@@ -33,9 +33,7 @@ func TestBackendSaveRetry(t *testing.T) {
 		},
 	}
 
-	retryBackend := RetryBackend{
-		Backend: be,
-	}
+	retryBackend := NewRetryBackend(be, 10, nil)
 
 	data := test.Random(23, 5*1024*1024+11241)
 	err := retryBackend.Save(context.TODO(), restic.Handle{}, restic.NewByteReader(data))
@@ -73,12 +71,10 @@ func TestBackendListRetry(t *testing.T) {
 		},
 	}
 
-	retryBackend := RetryBackend{
-		Backend: be,
-	}
+	retryBackend := NewRetryBackend(be, 10, nil)
 
 	var listed []string
-	err := retryBackend.List(context.TODO(), restic.DataFile, func(fi restic.FileInfo) error {
+	err := retryBackend.List(context.TODO(), restic.PackFile, func(fi restic.FileInfo) error {
 		listed = append(listed, fi.Name)
 		return nil
 	})
@@ -104,15 +100,13 @@ func TestBackendListRetryErrorFn(t *testing.T) {
 		},
 	}
 
-	retryBackend := RetryBackend{
-		Backend: be,
-	}
+	retryBackend := NewRetryBackend(be, 10, nil)
 
 	var ErrTest = errors.New("test error")
 
 	var listed []string
 	run := 0
-	err := retryBackend.List(context.TODO(), restic.DataFile, func(fi restic.FileInfo) error {
+	err := retryBackend.List(context.TODO(), restic.PackFile, func(fi restic.FileInfo) error {
 		t.Logf("fn called for %v", fi.Name)
 		run++
 		// return an error for the third item in the list
@@ -162,13 +156,10 @@ func TestBackendListRetryErrorBackend(t *testing.T) {
 	}
 
 	const maxRetries = 2
-	retryBackend := RetryBackend{
-		MaxTries: maxRetries,
-		Backend:  be,
-	}
+	retryBackend := NewRetryBackend(be, maxRetries, nil)
 
 	var listed []string
-	err := retryBackend.List(context.TODO(), restic.DataFile, func(fi restic.FileInfo) error {
+	err := retryBackend.List(context.TODO(), restic.PackFile, func(fi restic.FileInfo) error {
 		t.Logf("fn called for %v", fi.Name)
 		listed = append(listed, fi.Name)
 		return nil
@@ -234,9 +225,7 @@ func TestBackendLoadRetry(t *testing.T) {
 		return failingReader{data: data, limit: limit}, nil
 	}
 
-	retryBackend := RetryBackend{
-		Backend: be,
-	}
+	retryBackend := NewRetryBackend(be, 10, nil)
 
 	var buf []byte
 	err := retryBackend.Load(context.TODO(), restic.Handle{}, 0, 0, func(rd io.Reader) (err error) {

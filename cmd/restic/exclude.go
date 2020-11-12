@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -73,8 +74,9 @@ type RejectFunc func(path string, fi os.FileInfo) bool
 // rejectByPattern returns a RejectByNameFunc which rejects files that match
 // one of the patterns.
 func rejectByPattern(patterns []string) RejectByNameFunc {
+	parsedPatterns := filter.ParsePatterns(patterns)
 	return func(item string) bool {
-		matched, _, err := filter.List(patterns, item)
+		matched, err := filter.List(parsedPatterns, item)
 		if err != nil {
 			Warnf("error for exclude pattern: %v", err)
 		}
@@ -190,7 +192,7 @@ func isDirExcludedByFile(dir, tagFilename, header string) bool {
 		Warnf("could not read signature from exclusion tagfile %q: %v\n", tf, err)
 		return false
 	}
-	if bytes.Compare(buf, []byte(header)) != 0 {
+	if !bytes.Equal(buf, []byte(header)) {
 		Warnf("invalid signature in exclusion tagfile %q\n", tf)
 		return false
 	}
@@ -233,10 +235,6 @@ func rejectByDevice(samples []string) (RejectFunc, error) {
 	debug.Log("allowed devices: %v\n", allowed)
 
 	return func(item string, fi os.FileInfo) bool {
-		if fi == nil {
-			return false
-		}
-
 		item = filepath.Clean(item)
 
 		id, err := fs.DeviceID(fi)
@@ -291,4 +289,55 @@ func rejectResticCache(repo *repository.Repository) (RejectByNameFunc, error) {
 
 		return false
 	}, nil
+}
+
+func rejectBySize(maxSizeStr string) (RejectFunc, error) {
+	maxSize, err := parseSizeStr(maxSizeStr)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(item string, fi os.FileInfo) bool {
+		// directory will be ignored
+		if fi.IsDir() {
+			return false
+		}
+
+		filesize := fi.Size()
+		if filesize > maxSize {
+			debug.Log("file %s is oversize: %d", item, filesize)
+			return true
+		}
+
+		return false
+	}, nil
+}
+
+func parseSizeStr(sizeStr string) (int64, error) {
+	if sizeStr == "" {
+		return 0, errors.New("expected size, got empty string")
+	}
+
+	numStr := sizeStr[:len(sizeStr)-1]
+	var unit int64 = 1
+
+	switch sizeStr[len(sizeStr)-1] {
+	case 'b', 'B':
+		// use initialized values, do nothing here
+	case 'k', 'K':
+		unit = 1024
+	case 'm', 'M':
+		unit = 1024 * 1024
+	case 'g', 'G':
+		unit = 1024 * 1024 * 1024
+	case 't', 'T':
+		unit = 1024 * 1024 * 1024 * 1024
+	default:
+		numStr = sizeStr
+	}
+	value, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value * unit, nil
 }

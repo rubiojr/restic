@@ -225,18 +225,12 @@ func (env *TravisEnvironment) Prepare() error {
 			env.goxOSArch = []string{
 				"linux/386", "linux/amd64",
 				"windows/386", "windows/amd64",
-				"darwin/386", "darwin/amd64",
+				"darwin/amd64",
 				"freebsd/386", "freebsd/amd64",
 				"openbsd/386", "openbsd/amd64",
 				"netbsd/386", "netbsd/amd64",
 				"linux/arm", "freebsd/arm",
-				"linux/ppc64le",
-			}
-
-			if os.Getenv("RESTIC_BUILD_SOLARIS") == "0" {
-				msg("Skipping Solaris build\n")
-			} else {
-				env.goxOSArch = append(env.goxOSArch, "solaris/amd64")
+				"linux/ppc64le", "solaris/amd64",
 			}
 		} else {
 			env.goxOSArch = []string{runtime.GOOS + "/" + runtime.GOARCH}
@@ -368,7 +362,7 @@ func (env *TravisEnvironment) RunTests() error {
 			return err
 		}
 	} else {
-		msg("Skipping gofmt and module vendor check for %v\n", v)
+		msg("Skipping gofmt and mod tidy check for %v\n", v)
 	}
 
 	if err = runGlyphcheck(); err != nil {

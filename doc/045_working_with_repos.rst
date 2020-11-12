@@ -82,6 +82,89 @@ Furthermore you can group the output by the same filters (host, paths, tags):
     1 snapshots
 
 
+Copying snapshots between repositories
+======================================
+
+In case you want to transfer snapshots between two repositories, for
+example from a local to a remote repository, you can use the ``copy`` command:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy
+    repository d6504c63 opened successfully, password is correct
+    repository 3dd0878c opened successfully, password is correct
+
+    snapshot 410b18a2 of [/home/user/work] at 2020-06-09 23:15:57.305305 +0200 CEST)
+      copy started, this may take a while...
+    snapshot 7a746a07 saved
+
+    snapshot 4e5d5487 of [/home/user/work] at 2020-05-01 22:44:07.012113 +0200 CEST)
+    skipping snapshot 4e5d5487, was already copied to snapshot 50eb62b7
+
+The example command copies all snapshots from the source repository
+``/srv/restic-repo`` to the destination repository ``/srv/restic-repo-copy``.
+Snapshots which have previously been copied between repositories will
+be skipped by later copy runs.
+
+.. note:: Note that this process will have to read (download) and write (upload) the
+    entire snapshot(s) due to the different encryption keys used in the source and
+    destination repository. Also, the transferred files are not re-chunked, which
+    may break deduplication between files already stored in the destination repo
+    and files copied there using this command. See the next section for how to avoid
+    this problem.
+
+For the destination repository ``--repo2`` the password can be read from
+a file ``--password-file2`` or from a command ``--password-command2``.
+Alternatively the environment variables ``$RESTIC_PASSWORD_COMMAND2`` and
+``$RESTIC_PASSWORD_FILE2`` can be used. It is also possible to directly
+pass the password via ``$RESTIC_PASSWORD2``. The key which should be used
+for decryption can be selected by passing its ID via the flag ``--key-hint2``
+or the environment variable ``$RESTIC_KEY_HINT2``.
+
+In case the source and destination repository use the same backend, then
+configuration options and environment variables to configure the backend
+apply to both repositories. For example it might not be possible to specify
+different accounts for the source and destination repository. You can
+avoid this limitation by using the rclone backend along with remotes which
+are configured in rclone.
+
+The list of snapshots to copy can be filtered by host, path in the backup
+and / or a comma-separated tag list:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy --host luigi --path /srv --tag foo,bar
+
+It is also possible to explicitly specify the list of snapshots to copy, in
+which case only these instead of all snapshots will be copied:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy 410b18a2 4e5d5487 latest
+
+
+Ensuring deduplication for copied snapshots
+-------------------------------------------
+
+Even though the copy command can transfer snapshots between arbitrary repositories,
+deduplication between snapshots from the source and destination repository may not work.
+To ensure proper deduplication, both repositories have to use the same parameters for
+splitting large files into smaller chunks, which requires additional setup steps. With
+the same parameters restic will for both repositories split identical files into
+identical chunks and therefore deduplication also works for snapshots copied between
+these repositories.
+
+The chunker parameters are generated once when creating a new (destination) repository.
+That is for a copy destination repository we have to instruct restic to initialize it
+using the same chunker parameters as the source repository:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo-copy init --repo2 /srv/restic-repo --copy-chunker-params
+
+Note that it is not possible to change the chunker parameters of an existing repository.
+
+
 Checking integrity and consistency
 ==================================
 
@@ -134,10 +217,10 @@ If the repository structure is intact, restic will show that no errors were foun
     check snapshots, trees and blobs
     no errors were found
 
-By default, the ``check`` command does not verify that the actual data files
+By default, the ``check`` command does not verify that the actual pack files
 on disk in the repository are unmodified, because doing so requires reading
-a copy of every data file in the repository. To tell restic to also verify the
-integrity of the data files in the repository, use the ``--read-data`` flag:
+a copy of every pack file in the repository. To tell restic to also verify the
+integrity of the pack files in the repository, use the ``--read-data`` flag:
 
 .. code-block:: console
 
@@ -151,16 +234,16 @@ integrity of the data files in the repository, use the ``--read-data`` flag:
     duration: 0:00
     no errors were found
 
-.. note:: Since ``--read-data`` has to download all data files in the
+.. note:: Since ``--read-data`` has to download all pack files in the
     repository, beware that it might incur higher bandwidth costs than usual
     and also that it takes more time than the default ``check``.
 
 Alternatively, use the ``--read-data-subset=n/t`` parameter to check only a
-subset of the repository data files at a time. The parameter takes two values,
-``n`` and ``t``. When the check command runs, all data files in the repository
+subset of the repository pack files at a time. The parameter takes two values,
+``n`` and ``t``. When the check command runs, all pack files in the repository
 are logically divided in ``t`` (roughly equal) groups, and only files that
 belong to group number ``n`` are checked. For example, the following commands
-check all repository data files over 5 separate invocations:
+check all repository pack files over 5 separate invocations:
 
 .. code-block:: console
 

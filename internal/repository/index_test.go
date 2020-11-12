@@ -3,6 +3,7 @@ package repository_test
 import (
 	"bytes"
 	"math/rand"
+	"sync"
 	"testing"
 
 	"github.com/restic/restic/internal/repository"
@@ -55,19 +56,22 @@ func TestIndexSerialize(t *testing.T) {
 	err := idx.Encode(wr)
 	rtest.OK(t, err)
 
-	idx2, err := repository.DecodeIndex(wr.Bytes())
+	idx2ID := restic.NewRandomID()
+	idx2, oldFormat, err := repository.DecodeIndex(wr.Bytes(), idx2ID)
 	rtest.OK(t, err)
 	rtest.Assert(t, idx2 != nil,
 		"nil returned for decoded index")
+	rtest.Assert(t, !oldFormat, "new index format recognized as old format")
+	indexID, err := idx2.IDs()
+	rtest.OK(t, err)
+	rtest.Equals(t, indexID, restic.IDs{idx2ID})
 
 	wr2 := bytes.NewBuffer(nil)
 	err = idx2.Encode(wr2)
 	rtest.OK(t, err)
 
 	for _, testBlob := range tests {
-		list, found := idx.Lookup(testBlob.id, testBlob.tpe)
-		rtest.Assert(t, found, "Expected to find blob id %v", testBlob.id.Str())
-
+		list := idx.Lookup(testBlob.id, testBlob.tpe, nil)
 		if len(list) != 1 {
 			t.Errorf("expected one result for blob %v, got %v: %v", testBlob.id.Str(), len(list), list)
 		}
@@ -78,9 +82,7 @@ func TestIndexSerialize(t *testing.T) {
 		rtest.Equals(t, testBlob.offset, result.Offset)
 		rtest.Equals(t, testBlob.length, result.Length)
 
-		list2, found := idx2.Lookup(testBlob.id, testBlob.tpe)
-		rtest.Assert(t, found, "Expected to find blob id %v", testBlob.id)
-
+		list2 := idx2.Lookup(testBlob.id, testBlob.tpe, nil)
 		if len(list2) != 1 {
 			t.Errorf("expected one result for blob %v, got %v: %v", testBlob.id.Str(), len(list2), list2)
 		}
@@ -123,9 +125,10 @@ func TestIndexSerialize(t *testing.T) {
 		}
 	}
 
-	// serialize idx, unserialize to idx3
+	// finalize; serialize idx, unserialize to idx3
+	idx.Finalize()
 	wr3 := bytes.NewBuffer(nil)
-	err = idx.Finalize(wr3)
+	err = idx.Encode(wr3)
 	rtest.OK(t, err)
 
 	rtest.Assert(t, idx.Final(),
@@ -133,23 +136,21 @@ func TestIndexSerialize(t *testing.T) {
 
 	id := restic.NewRandomID()
 	rtest.OK(t, idx.SetID(id))
-	id2, err := idx.ID()
+	ids, err := idx.IDs()
 	rtest.OK(t, err)
-	rtest.Assert(t, id2.Equal(id),
-		"wrong ID returned: want %v, got %v", id, id2)
+	rtest.Equals(t, restic.IDs{id}, ids)
 
-	idx3, err := repository.DecodeIndex(wr3.Bytes())
+	idx3, oldFormat, err := repository.DecodeIndex(wr3.Bytes(), id)
 	rtest.OK(t, err)
 	rtest.Assert(t, idx3 != nil,
 		"nil returned for decoded index")
 	rtest.Assert(t, idx3.Final(),
 		"decoded index is not final")
+	rtest.Assert(t, !oldFormat, "new index format recognized as old format")
 
 	// all new blobs must be in the index
 	for _, testBlob := range newtests {
-		list, found := idx3.Lookup(testBlob.id, testBlob.tpe)
-		rtest.Assert(t, found, "Expected to find blob id %v", testBlob.id.Str())
-
+		list := idx3.Lookup(testBlob.id, testBlob.tpe, nil)
 		if len(list) != 1 {
 			t.Errorf("expected one result for blob %v, got %v: %v", testBlob.id.Str(), len(list), list)
 		}
@@ -290,13 +291,12 @@ var exampleLookupTest = struct {
 func TestIndexUnserialize(t *testing.T) {
 	oldIdx := restic.IDs{restic.TestParseID("ed54ae36197f4745ebc4b54d10e0f623eaaaedd03013eb7ae90df881b7781452")}
 
-	idx, err := repository.DecodeIndex(docExample)
+	idx, oldFormat, err := repository.DecodeIndex(docExample, restic.NewRandomID())
 	rtest.OK(t, err)
+	rtest.Assert(t, !oldFormat, "new index format recognized as old format")
 
 	for _, test := range exampleTests {
-		list, found := idx.Lookup(test.id, test.tpe)
-		rtest.Assert(t, found, "Expected to find blob id %v", test.id.Str())
-
+		list := idx.Lookup(test.id, test.tpe, nil)
 		if len(list) != 1 {
 			t.Errorf("expected one result for blob %v, got %v: %v", test.id.Str(), len(list), list)
 		}
@@ -328,23 +328,51 @@ func TestIndexUnserialize(t *testing.T) {
 	}
 }
 
+var (
+	benchmarkIndexJSON     []byte
+	benchmarkIndexJSONOnce sync.Once
+)
+
+func initBenchmarkIndexJSON() {
+	idx, _ := createRandomIndex(rand.New(rand.NewSource(0)), 200000)
+	var buf bytes.Buffer
+	idx.Encode(&buf)
+	benchmarkIndexJSON = buf.Bytes()
+}
+
 func BenchmarkDecodeIndex(b *testing.B) {
+	benchmarkIndexJSONOnce.Do(initBenchmarkIndexJSON)
+
+	id := restic.NewRandomID()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, err := repository.DecodeIndex(docExample)
+		_, _, err := repository.DecodeIndex(benchmarkIndexJSON, id)
 		rtest.OK(b, err)
 	}
 }
 
+func BenchmarkDecodeIndexParallel(b *testing.B) {
+	benchmarkIndexJSONOnce.Do(initBenchmarkIndexJSON)
+	id := restic.NewRandomID()
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _, err := repository.DecodeIndex(benchmarkIndexJSON, id)
+			rtest.OK(b, err)
+		}
+	})
+}
+
 func TestIndexUnserializeOld(t *testing.T) {
-	idx, err := repository.DecodeOldIndex(docOldExample)
+	idx, oldFormat, err := repository.DecodeIndex(docOldExample, restic.NewRandomID())
 	rtest.OK(t, err)
+	rtest.Assert(t, oldFormat, "old index format recognized as new format")
 
 	for _, test := range exampleTests {
-		list, found := idx.Lookup(test.id, test.tpe)
-		rtest.Assert(t, found, "Expected to find blob id %v", test.id.Str())
-
+		list := idx.Lookup(test.id, test.tpe, nil)
 		if len(list) != 1 {
 			t.Errorf("expected one result for blob %v, got %v: %v", test.id.Str(), len(list), list)
 		}
@@ -391,31 +419,30 @@ func NewRandomTestID(rng *rand.Rand) restic.ID {
 	return id
 }
 
-func createRandomIndex(rng *rand.Rand) (idx *repository.Index, lookupID restic.ID) {
+func createRandomIndex(rng *rand.Rand, packfiles int) (idx *repository.Index, lookupID restic.ID) {
 	idx = repository.NewIndex()
 
-	// create index with 200k pack files
-	for i := 0; i < 200000; i++ {
+	// create index with given number of pack files
+	for i := 0; i < packfiles; i++ {
 		packID := NewRandomTestID(rng)
+		var blobs []restic.Blob
 		offset := 0
 		for offset < maxPackSize {
-			size := 2000 + rand.Intn(4*1024*1024)
+			size := 2000 + rng.Intn(4*1024*1024)
 			id := NewRandomTestID(rng)
-			idx.Store(restic.PackedBlob{
-				PackID: packID,
-				Blob: restic.Blob{
-					Type:   restic.DataBlob,
-					ID:     id,
-					Length: uint(size),
-					Offset: uint(offset),
-				},
+			blobs = append(blobs, restic.Blob{
+				Type:   restic.DataBlob,
+				ID:     id,
+				Length: uint(size),
+				Offset: uint(offset),
 			})
 
 			offset += size
+		}
+		idx.StorePack(packID, blobs)
 
-			if rand.Float32() < 0.001 && lookupID.IsNull() {
-				lookupID = id
-			}
+		if i == 0 {
+			lookupID = blobs[rng.Intn(len(blobs))].ID
 		}
 	}
 
@@ -423,7 +450,7 @@ func createRandomIndex(rng *rand.Rand) (idx *repository.Index, lookupID restic.I
 }
 
 func BenchmarkIndexHasUnknown(b *testing.B) {
-	idx, _ := createRandomIndex(rand.New(rand.NewSource(0)))
+	idx, _ := createRandomIndex(rand.New(rand.NewSource(0)), 200000)
 	lookupID := restic.NewRandomID()
 
 	b.ResetTimer()
@@ -434,13 +461,33 @@ func BenchmarkIndexHasUnknown(b *testing.B) {
 }
 
 func BenchmarkIndexHasKnown(b *testing.B) {
-	idx, lookupID := createRandomIndex(rand.New(rand.NewSource(0)))
+	idx, lookupID := createRandomIndex(rand.New(rand.NewSource(0)), 200000)
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
 		idx.Has(lookupID, restic.DataBlob)
 	}
+}
+
+func BenchmarkIndexAlloc(b *testing.B) {
+	rng := rand.New(rand.NewSource(0))
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		createRandomIndex(rng, 200000)
+	}
+}
+
+func BenchmarkIndexAllocParallel(b *testing.B) {
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		rng := rand.New(rand.NewSource(0))
+		for pb.Next() {
+			createRandomIndex(rng, 200000)
+		}
+	})
 }
 
 func TestIndexHas(t *testing.T) {

@@ -91,12 +91,7 @@ func saveFile(t testing.TB, repo restic.Repository, filename string, filesystem 
 		t.Fatal(err)
 	}
 
-	err = repo.Flush(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = repo.SaveIndex(ctx)
+	err = repo.Flush(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,13 +413,16 @@ type blobCountingRepo struct {
 	saved map[restic.BlobHandle]uint
 }
 
-func (repo *blobCountingRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID) (restic.ID, error) {
-	id, err := repo.Repository.SaveBlob(ctx, t, buf, id)
+func (repo *blobCountingRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (restic.ID, bool, error) {
+	id, exists, err := repo.Repository.SaveBlob(ctx, t, buf, id, false)
+	if exists {
+		return id, exists, err
+	}
 	h := restic.BlobHandle{ID: id, Type: t}
 	repo.m.Lock()
 	repo.saved[h]++
 	repo.m.Unlock()
-	return id, err
+	return id, exists, err
 }
 
 func (repo *blobCountingRepo) SaveTree(ctx context.Context, t *restic.Tree) (restic.ID, error) {
@@ -805,7 +803,7 @@ func TestArchiverSaveDir(t *testing.T) {
 				chdir = filepath.Join(chdir, test.chdir)
 			}
 
-			back := fs.TestChdir(t, chdir)
+			back := restictest.Chdir(t, chdir)
 			defer back()
 
 			fi, err := fs.Lstat(test.target)
@@ -813,7 +811,7 @@ func TestArchiverSaveDir(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ft, err := arch.SaveDir(ctx, "/", fi, test.target, nil)
+			ft, err := arch.SaveDir(ctx, "/", fi, test.target, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -834,13 +832,14 @@ func TestArchiverSaveDir(t *testing.T) {
 			if stats.DataBlobs != 0 {
 				t.Errorf("wrong stats returned in DataBlobs, want 0, got %d", stats.DataBlobs)
 			}
-			if stats.TreeSize <= 0 {
+			if stats.TreeSize == 0 {
 				t.Errorf("wrong stats returned in TreeSize, want > 0, got %d", stats.TreeSize)
 			}
 			if stats.TreeBlobs <= 0 {
 				t.Errorf("wrong stats returned in TreeBlobs, want > 0, got %d", stats.TreeBlobs)
 			}
 
+			ctx = context.Background()
 			node.Name = targetNodeName
 			tree := &restic.Tree{Nodes: []*restic.Node{node}}
 			treeID, err := repo.SaveTree(ctx, tree)
@@ -849,11 +848,6 @@ func TestArchiverSaveDir(t *testing.T) {
 			}
 
 			err = repo.Flush(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			err = repo.SaveIndex(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -895,7 +889,7 @@ func TestArchiverSaveDirIncremental(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		ft, err := arch.SaveDir(ctx, "/", fi, tempdir, nil)
+		ft, err := arch.SaveDir(ctx, "/", fi, tempdir, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -917,7 +911,7 @@ func TestArchiverSaveDirIncremental(t *testing.T) {
 			if stats.DataBlobs != 0 {
 				t.Errorf("wrong stats returned in DataBlobs, want 0, got %d", stats.DataBlobs)
 			}
-			if stats.TreeSize <= 0 {
+			if stats.TreeSize == 0 {
 				t.Errorf("wrong stats returned in TreeSize, want > 0, got %d", stats.TreeSize)
 			}
 			if stats.TreeBlobs <= 0 {
@@ -941,12 +935,7 @@ func TestArchiverSaveDirIncremental(t *testing.T) {
 
 		t.Logf("node subtree %v", node.Subtree)
 
-		err = repo.Flush(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		err = repo.SaveIndex(ctx)
+		err = repo.Flush(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -956,6 +945,14 @@ func TestArchiverSaveDirIncremental(t *testing.T) {
 				t.Errorf("iteration %v: blob %v saved more than once (%d times)", i, h, n)
 			}
 		}
+	}
+}
+
+// bothZeroOrNeither fails the test if only one of exp, act is zero.
+func bothZeroOrNeither(tb testing.TB, exp, act uint64) {
+	if (exp == 0 && act != 0) || (exp != 0 && act == 0) {
+		_, file, line, _ := runtime.Caller(1)
+		tb.Fatalf("\033[31m%s:%d:\n\n\texp: %#v\n\n\tgot: %#v\033[39m\n\n", filepath.Base(file), line, exp, act)
 	}
 }
 
@@ -969,11 +966,13 @@ func TestArchiverSaveTree(t *testing.T) {
 		}
 	}
 
+	// The toplevel directory is not counted in the ItemStats
 	var tests = []struct {
 		src     TestDir
 		prepare func(t testing.TB)
 		targets []string
 		want    TestDir
+		stat    ItemStats
 	}{
 		{
 			src: TestDir{
@@ -983,6 +982,7 @@ func TestArchiverSaveTree(t *testing.T) {
 			want: TestDir{
 				"targetfile": TestFile{Content: string("foobar")},
 			},
+			stat: ItemStats{1, 6, 0, 0},
 		},
 		{
 			src: TestDir{
@@ -994,6 +994,7 @@ func TestArchiverSaveTree(t *testing.T) {
 				"targetfile":  TestFile{Content: string("foobar")},
 				"filesymlink": TestSymlink{Target: "targetfile"},
 			},
+			stat: ItemStats{1, 6, 0, 0},
 		},
 		{
 			src: TestDir{
@@ -1013,6 +1014,7 @@ func TestArchiverSaveTree(t *testing.T) {
 					"symlink": TestSymlink{Target: "subdir"},
 				},
 			},
+			stat: ItemStats{0, 0, 1, 0x154},
 		},
 		{
 			src: TestDir{
@@ -1036,6 +1038,7 @@ func TestArchiverSaveTree(t *testing.T) {
 					},
 				},
 			},
+			stat: ItemStats{1, 6, 3, 0x47f},
 		},
 	}
 
@@ -1050,9 +1053,18 @@ func TestArchiverSaveTree(t *testing.T) {
 			testFS := fs.Track{FS: fs.Local{}}
 
 			arch := New(repo, testFS, Options{})
+
+			var stat ItemStats
+			lock := &sync.Mutex{}
+			arch.CompleteItem = func(item string, previous, current *restic.Node, s ItemStats, d time.Duration) {
+				lock.Lock()
+				defer lock.Unlock()
+				stat.Add(s)
+			}
+
 			arch.runWorkers(ctx, &tmb)
 
-			back := fs.TestChdir(t, tempdir)
+			back := restictest.Chdir(t, tempdir)
 			defer back()
 
 			if test.prepare != nil {
@@ -1080,12 +1092,8 @@ func TestArchiverSaveTree(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			ctx = context.Background()
 			err = repo.Flush(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			err = repo.SaveIndex(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1095,6 +1103,10 @@ func TestArchiverSaveTree(t *testing.T) {
 				want = test.src
 			}
 			TestEnsureTree(ctx, t, "/", repo, treeID, want)
+			bothZeroOrNeither(t, uint64(test.stat.DataBlobs), uint64(stat.DataBlobs))
+			bothZeroOrNeither(t, uint64(test.stat.TreeBlobs), uint64(stat.TreeBlobs))
+			bothZeroOrNeither(t, test.stat.DataSize, stat.DataSize)
+			bothZeroOrNeither(t, test.stat.TreeSize, stat.TreeSize)
 		})
 	}
 }
@@ -1343,7 +1355,7 @@ func TestArchiverSnapshot(t *testing.T) {
 				chdir = filepath.Join(chdir, filepath.FromSlash(test.chdir))
 			}
 
-			back := fs.TestChdir(t, chdir)
+			back := restictest.Chdir(t, chdir)
 			defer back()
 
 			var targets []string
@@ -1448,10 +1460,7 @@ func TestArchiverSnapshotSelect(t *testing.T) {
 				"other": TestFile{Content: "another file"},
 			},
 			selFn: func(item string, fi os.FileInfo) bool {
-				if filepath.Ext(item) == ".txt" {
-					return false
-				}
-				return true
+				return filepath.Ext(item) != ".txt"
 			},
 		},
 		{
@@ -1475,10 +1484,7 @@ func TestArchiverSnapshotSelect(t *testing.T) {
 				"other": TestFile{Content: "another file"},
 			},
 			selFn: func(item string, fi os.FileInfo) bool {
-				if filepath.Base(item) == "subdir" {
-					return false
-				}
-				return true
+				return filepath.Base(item) != "subdir"
 			},
 		},
 		{
@@ -1503,7 +1509,7 @@ func TestArchiverSnapshotSelect(t *testing.T) {
 			arch := New(repo, fs.Track{FS: fs.Local{}}, Options{})
 			arch.Select = test.selFn
 
-			back := fs.TestChdir(t, tempdir)
+			back := restictest.Chdir(t, tempdir)
 			defer back()
 
 			targets := []string{"."}
@@ -1610,7 +1616,7 @@ func TestArchiverParent(t *testing.T) {
 
 			arch := New(repo, testFS, Options{})
 
-			back := fs.TestChdir(t, tempdir)
+			back := restictest.Chdir(t, tempdir)
 			defer back()
 
 			_, firstSnapshotID, err := arch.Snapshot(ctx, []string{"."}, SnapshotOptions{Time: time.Now()})
@@ -1770,7 +1776,7 @@ func TestArchiverErrorReporting(t *testing.T) {
 			tempdir, repo, cleanup := prepareTempdirRepoSrc(t, test.src)
 			defer cleanup()
 
-			back := fs.TestChdir(t, tempdir)
+			back := restictest.Chdir(t, tempdir)
 			defer back()
 
 			if test.prepare != nil {
@@ -1841,13 +1847,13 @@ type failSaveRepo struct {
 	err       error
 }
 
-func (f *failSaveRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID) (restic.ID, error) {
+func (f *failSaveRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (restic.ID, bool, error) {
 	val := atomic.AddInt32(&f.cnt, 1)
 	if val >= f.failAfter {
-		return restic.ID{}, f.err
+		return restic.ID{}, false, f.err
 	}
 
-	return f.Repository.SaveBlob(ctx, t, buf, id)
+	return f.Repository.SaveBlob(ctx, t, buf, id, storeDuplicate)
 }
 
 func TestArchiverAbortEarlyOnError(t *testing.T) {
@@ -1911,7 +1917,7 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 			tempdir, repo, cleanup := prepareTempdirRepoSrc(t, test.src)
 			defer cleanup()
 
-			back := fs.TestChdir(t, tempdir)
+			back := restictest.Chdir(t, tempdir)
 			defer back()
 
 			testFS := &TrackFS{
@@ -1980,13 +1986,6 @@ func snapshot(t testing.TB, repo restic.Repository, fs fs.FS, parent restic.ID, 
 	return snapshotID, node
 }
 
-func chmod(t testing.TB, filename string, mode os.FileMode) {
-	err := os.Chmod(filename, mode)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 // StatFS allows overwriting what is returned by the Lstat function.
 type StatFS struct {
 	fs.FS
@@ -2049,7 +2048,7 @@ func TestMetadataChanged(t *testing.T) {
 	tempdir, repo, cleanup := prepareTempdirRepoSrc(t, files)
 	defer cleanup()
 
-	back := fs.TestChdir(t, tempdir)
+	back := restictest.Chdir(t, tempdir)
 	defer back()
 
 	// get metadata
@@ -2097,7 +2096,7 @@ func TestMetadataChanged(t *testing.T) {
 	want.Group = ""
 
 	// make another snapshot
-	snapshotID, node3 := snapshot(t, repo, fs, snapshotID, "testfile")
+	_, node3 := snapshot(t, repo, fs, snapshotID, "testfile")
 	// Override username and group to empty string - in case underlying system has user with UID 51234
 	// See https://github.com/restic/restic/issues/2372
 	node3.User = ""
@@ -2124,7 +2123,7 @@ func TestRacyFileSwap(t *testing.T) {
 	tempdir, repo, cleanup := prepareTempdirRepoSrc(t, files)
 	defer cleanup()
 
-	back := fs.TestChdir(t, tempdir)
+	back := restictest.Chdir(t, tempdir)
 	defer back()
 
 	// get metadata of current folder

@@ -3,12 +3,12 @@ package repository
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/cache"
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/debug"
@@ -17,21 +17,23 @@ import (
 	"github.com/restic/restic/internal/hashing"
 	"github.com/restic/restic/internal/pack"
 	"github.com/restic/restic/internal/restic"
+
+	"github.com/minio/sha256-simd"
 	"golang.org/x/sync/errgroup"
 )
 
 // Repository is used to access a repository in a backend.
 type Repository struct {
-	be      restic.Backend
-	cfg     restic.Config
-	key     *crypto.Key
-	keyName string
-	idx     *MasterIndex
-	restic.Cache
-	minPackSize uint
-
-	treePM *packerManager
-	dataPM *packerManager
+	be                restic.Backend
+	cfg               restic.Config
+	key               *crypto.Key
+	keyName           string
+	idx               *MasterIndex
+	minPackSize       uint
+	Cache             *cache.Cache
+	noAutoIndexUpdate bool
+	treePM            *packerManager
+	dataPM            *packerManager
 }
 
 // New returns a new repository with backend be.
@@ -52,13 +54,19 @@ func (r *Repository) MinPackSize() uint {
 	return r.minPackSize
 }
 
+// DisableAutoIndexUpdate deactives the automatic finalization and upload of new
+// indexes once these are full
+func (r *Repository) DisableAutoIndexUpdate() {
+	r.noAutoIndexUpdate = true
+}
+
 // Config returns the repository configuration.
 func (r *Repository) Config() restic.Config {
 	return r.cfg
 }
 
 // UseCache replaces the backend with the wrapped cache.
-func (r *Repository) UseCache(c restic.Cache) {
+func (r *Repository) UseCache(c *cache.Cache) {
 	if c == nil {
 		return
 	}
@@ -69,8 +77,8 @@ func (r *Repository) UseCache(c restic.Cache) {
 
 // PrefixLength returns the number of bytes required so that all prefixes of
 // all IDs of type t are unique.
-func (r *Repository) PrefixLength(t restic.FileType) (int, error) {
-	return restic.PrefixLength(r.be, t)
+func (r *Repository) PrefixLength(ctx context.Context, t restic.FileType) (int, error) {
+	return restic.PrefixLength(ctx, r.be, t)
 }
 
 // LoadAndDecrypt loads and decrypts the file with the given type and ID, using
@@ -112,29 +120,33 @@ func (r *Repository) LoadAndDecrypt(ctx context.Context, buf []byte, t restic.Fi
 	return plaintext, nil
 }
 
-// sortCachedPacks moves all cached pack files to the front of blobs.
-func (r *Repository) sortCachedPacks(blobs []restic.PackedBlob) []restic.PackedBlob {
-	if r.Cache == nil {
-		return blobs
+type haver interface {
+	Has(restic.Handle) bool
+}
+
+// sortCachedPacksFirst moves all cached pack files to the front of blobs.
+func sortCachedPacksFirst(cache haver, blobs []restic.PackedBlob) {
+	if cache == nil {
+		return
 	}
 
 	// no need to sort a list with one element
 	if len(blobs) == 1 {
-		return blobs
+		return
 	}
 
-	cached := make([]restic.PackedBlob, 0, len(blobs)/2)
+	cached := blobs[:0]
 	noncached := make([]restic.PackedBlob, 0, len(blobs)/2)
 
 	for _, blob := range blobs {
-		if r.Cache.Has(restic.Handle{Type: restic.DataFile, Name: blob.PackID.String()}) {
+		if cache.Has(restic.Handle{Type: restic.PackFile, Name: blob.PackID.String()}) {
 			cached = append(cached, blob)
 			continue
 		}
 		noncached = append(noncached, blob)
 	}
 
-	return append(cached, noncached...)
+	copy(blobs[len(cached):], noncached)
 }
 
 // LoadBlob loads a blob of type t from the repository.
@@ -143,14 +155,14 @@ func (r *Repository) LoadBlob(ctx context.Context, t restic.BlobType, id restic.
 	debug.Log("load %v with id %v (buf len %v, cap %d)", t, id, len(buf), cap(buf))
 
 	// lookup packs
-	blobs, found := r.idx.Lookup(id, t)
-	if !found {
+	blobs := r.idx.Lookup(id, t)
+	if len(blobs) == 0 {
 		debug.Log("id %v not found in index", id)
 		return nil, errors.Errorf("id %v not found in repository", id)
 	}
 
 	// try cached pack files first
-	blobs = r.sortCachedPacks(blobs)
+	sortCachedPacksFirst(r.Cache, blobs)
 
 	var lastError error
 	for _, blob := range blobs {
@@ -161,7 +173,7 @@ func (r *Repository) LoadBlob(ctx context.Context, t restic.BlobType, id restic.
 		}
 
 		// load blob from pack
-		h := restic.Handle{Type: restic.DataFile, Name: blob.PackID.String()}
+		h := restic.Handle{Type: restic.PackFile, Name: blob.PackID.String()}
 
 		switch {
 		case cap(buf) < int(blob.Length):
@@ -228,13 +240,8 @@ func (r *Repository) LookupBlobSize(id restic.ID, tpe restic.BlobType) (uint, bo
 
 // SaveAndEncrypt encrypts data and stores it to the backend as type t. If data
 // is small enough, it will be packed together with other small blobs.
-func (r *Repository) SaveAndEncrypt(ctx context.Context, t restic.BlobType, data []byte, id *restic.ID) (restic.ID, error) {
-	if id == nil {
-		// compute plaintext hash
-		hashedID := restic.Hash(data)
-		id = &hashedID
-	}
-
+// The caller must ensure that the id matches the data.
+func (r *Repository) SaveAndEncrypt(ctx context.Context, t restic.BlobType, data []byte, id restic.ID) error {
 	debug.Log("save id %v (%v, %d bytes)", id, t, len(data))
 
 	nonce := crypto.NewRandomNonce()
@@ -259,24 +266,24 @@ func (r *Repository) SaveAndEncrypt(ctx context.Context, t restic.BlobType, data
 
 	packer, err := pm.findPacker()
 	if err != nil {
-		return restic.ID{}, err
+		return err
 	}
 
 	// save ciphertext
-	_, err = packer.Add(t, *id, ciphertext)
+	_, err = packer.Add(t, id, ciphertext)
 	if err != nil {
-		return restic.ID{}, err
+		return err
 	}
 
 	// if the pack is not full enough, put back to the list
 	if packer.Size() < r.minPackSize {
 		debug.Log("pack is not full enough (%d bytes)", packer.Size())
 		pm.insertPacker(packer)
-		return *id, nil
+		return nil
 	}
 
 	// else write the pack to the backend
-	return *id, r.savePacker(ctx, t, packer)
+	return r.savePacker(ctx, t, packer)
 }
 
 // SaveJSONUnpacked serialises item as JSON and encrypts and saves it in the
@@ -314,8 +321,21 @@ func (r *Repository) SaveUnpacked(ctx context.Context, t restic.FileType, p []by
 	return id, nil
 }
 
-// Flush saves all remaining packs.
+// Flush saves all remaining packs and the index
 func (r *Repository) Flush(ctx context.Context) error {
+	if err := r.FlushPacks(ctx); err != nil {
+		return err
+	}
+
+	// Save index after flushing only if noAutoIndexUpdate is not set
+	if r.noAutoIndexUpdate {
+		return nil
+	}
+	return r.SaveIndex(ctx)
+}
+
+// FlushPacks saves all remaining packs.
+func (r *Repository) FlushPacks(ctx context.Context) error {
 	pms := []struct {
 		t  restic.BlobType
 		pm *packerManager
@@ -338,7 +358,6 @@ func (r *Repository) Flush(ctx context.Context) error {
 		p.pm.packers = p.pm.packers[:0]
 		p.pm.pm.Unlock()
 	}
-
 	return nil
 }
 
@@ -348,22 +367,24 @@ func (r *Repository) Backend() restic.Backend {
 }
 
 // Index returns the currently used MasterIndex.
-func (r *Repository) Index() restic.Index {
+func (r *Repository) Index() restic.MasterIndex {
 	return r.idx
 }
 
 // SetIndex instructs the repository to use the given index.
-func (r *Repository) SetIndex(i restic.Index) error {
+func (r *Repository) SetIndex(i restic.MasterIndex) error {
 	r.idx = i.(*MasterIndex)
 
 	ids := restic.NewIDSet()
 	for _, idx := range r.idx.All() {
-		id, err := idx.ID()
+		indexIDs, err := idx.IDs()
 		if err != nil {
 			debug.Log("not using index, ID() returned error %v", err)
 			continue
 		}
-		ids.Insert(id)
+		for _, id := range indexIDs {
+			ids.Insert(id)
+		}
 	}
 
 	return r.PrepareCache(ids)
@@ -373,7 +394,7 @@ func (r *Repository) SetIndex(i restic.Index) error {
 func SaveIndex(ctx context.Context, repo restic.Repository, index *Index) (restic.ID, error) {
 	buf := bytes.NewBuffer(nil)
 
-	err := index.Finalize(buf)
+	err := index.Encode(buf)
 	if err != nil {
 		return restic.ID{}, err
 	}
@@ -393,18 +414,19 @@ func (r *Repository) saveIndex(ctx context.Context, indexes ...*Index) error {
 
 		debug.Log("Saved index %d as %v", i, sid)
 	}
+	r.idx.MergeFinalIndexes()
 
 	return nil
 }
 
 // SaveIndex saves all new indexes in the backend.
 func (r *Repository) SaveIndex(ctx context.Context) error {
-	return r.saveIndex(ctx, r.idx.NotFinalIndexes()...)
+	return r.saveIndex(ctx, r.idx.FinalizeNotFinalIndexes()...)
 }
 
 // SaveFullIndex saves all full indexes in the backend.
 func (r *Repository) SaveFullIndex(ctx context.Context) error {
-	return r.saveIndex(ctx, r.idx.FullIndexes()...)
+	return r.saveIndex(ctx, r.idx.FinalizeFullIndexes()...)
 }
 
 const loadIndexParallelism = 4
@@ -443,14 +465,13 @@ func (r *Repository) LoadIndex(ctx context.Context) error {
 		var buf []byte
 		for fi := range ch {
 			var err error
-			var idx *Index
-			idx, buf, err = LoadIndexWithDecoder(ctx, r, buf[:0], fi.ID, DecodeIndex)
-			if err != nil && errors.Cause(err) == ErrOldIndexFormat {
-				idx, buf, err = LoadIndexWithDecoder(ctx, r, buf[:0], fi.ID, DecodeOldIndex)
-			}
-
+			buf, err = r.LoadAndDecrypt(ctx, buf[:0], restic.IndexFile, fi.ID)
 			if err != nil {
-				return errors.Wrap(err, fmt.Sprintf("unable to load index %v", fi.ID.Str()))
+				return errors.Wrapf(err, "unable to load index %s", fi.ID.Str())
+			}
+			idx, _, err := DecodeIndex(buf, fi.ID)
+			if err != nil {
+				return errors.Wrapf(err, "unable to decode index %s", fi.ID.Str())
 			}
 
 			select {
@@ -462,26 +483,26 @@ func (r *Repository) LoadIndex(ctx context.Context) error {
 		return nil
 	}
 
-	// final closes indexCh after all workers have terminated
-	final := func() {
-		close(indexCh)
-	}
-
 	// run workers on ch
 	wg.Go(func() error {
-		return RunWorkers(ctx, loadIndexParallelism, worker, final)
+		defer close(indexCh)
+		return RunWorkers(loadIndexParallelism, worker)
 	})
 
 	// receive decoded indexes
 	validIndex := restic.NewIDSet()
 	wg.Go(func() error {
 		for idx := range indexCh {
-			id, err := idx.ID()
+			ids, err := idx.IDs()
 			if err == nil {
-				validIndex.Insert(id)
+				for _, id := range ids {
+					validIndex.Insert(id)
+				}
 			}
+
 			r.idx.Insert(idx)
 		}
+		r.idx.MergeFinalIndexes()
 		return nil
 	})
 
@@ -521,10 +542,10 @@ func (r *Repository) PrepareCache(indexIDs restic.IDSet) error {
 		}
 	}
 
-	// clear old data files
-	err = r.Cache.Clear(restic.DataFile, packs)
+	// clear old packs
+	err = r.Cache.Clear(restic.PackFile, packs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error clearing data files in cache: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error clearing pack files in cache: %v\n", err)
 	}
 
 	treePacks := restic.NewIDSet()
@@ -536,10 +557,10 @@ func (r *Repository) PrepareCache(indexIDs restic.IDSet) error {
 
 	// use readahead
 	debug.Log("using readahead")
-	cache := r.Cache.(*cache.Cache)
+	cache := r.Cache
 	cache.PerformReadahead = func(h restic.Handle) bool {
-		if h.Type != restic.DataFile {
-			debug.Log("no readahead for %v, is not data file", h)
+		if h.Type != restic.PackFile {
+			debug.Log("no readahead for %v, is not a pack file", h)
 			return false
 		}
 
@@ -562,18 +583,16 @@ func (r *Repository) PrepareCache(indexIDs restic.IDSet) error {
 
 // LoadIndex loads the index id from backend and returns it.
 func LoadIndex(ctx context.Context, repo restic.Repository, id restic.ID) (*Index, error) {
-	idx, _, err := LoadIndexWithDecoder(ctx, repo, nil, id, DecodeIndex)
-	if err == nil {
-		return idx, nil
+	buf, err := repo.LoadAndDecrypt(ctx, nil, restic.IndexFile, id)
+	if err != nil {
+		return nil, err
 	}
 
-	if errors.Cause(err) == ErrOldIndexFormat {
+	idx, oldFormat, err := DecodeIndex(buf, id)
+	if oldFormat {
 		fmt.Fprintf(os.Stderr, "index %v has old format\n", id.Str())
-		idx, _, err := LoadIndexWithDecoder(ctx, repo, nil, id, DecodeOldIndex)
-		return idx, err
 	}
-
-	return nil, err
+	return idx, err
 }
 
 // SearchKey finds a key with the supplied password, afterwards the config is
@@ -597,7 +616,7 @@ func (r *Repository) SearchKey(ctx context.Context, password string, maxKeys int
 
 // Init creates a new master key with the supplied password, initializes and
 // saves the repository config.
-func (r *Repository) Init(ctx context.Context, password string) error {
+func (r *Repository) Init(ctx context.Context, password string, chunkerPolynomial *chunker.Pol) error {
 	has, err := r.be.Test(ctx, restic.Handle{Type: restic.ConfigFile})
 	if err != nil {
 		return err
@@ -610,6 +629,9 @@ func (r *Repository) Init(ctx context.Context, password string) error {
 	if err != nil {
 		return err
 	}
+	if chunkerPolynomial != nil {
+		cfg.ChunkerPolynomial = *chunkerPolynomial
+	}
 
 	return r.init(ctx, password, cfg)
 }
@@ -617,7 +639,7 @@ func (r *Repository) Init(ctx context.Context, password string) error {
 // init creates a new master key with the supplied password and uses it to save
 // the config into the repo.
 func (r *Repository) init(ctx context.Context, password string, cfg restic.Config) error {
-	key, err := createMasterKey(r, password)
+	key, err := createMasterKey(ctx, r, password)
 	if err != nil {
 		return err
 	}
@@ -656,9 +678,9 @@ func (r *Repository) List(ctx context.Context, t restic.FileType, fn func(restic
 // ListPack returns the list of blobs saved in the pack id and the length of
 // the file as stored in the backend.
 func (r *Repository) ListPack(ctx context.Context, id restic.ID, size int64) ([]restic.Blob, int64, error) {
-	h := restic.Handle{Type: restic.DataFile, Name: id.String()}
+	h := restic.Handle{Type: restic.PackFile, Name: id.String()}
 
-	blobs, err := pack.List(r.Key(), restic.ReaderAt(r.Backend(), h), size)
+	blobs, err := pack.List(r.Key(), restic.ReaderAt(ctx, r.Backend(), h), size)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -677,14 +699,29 @@ func (r *Repository) Close() error {
 	return r.be.Close()
 }
 
-// SaveBlob saves a blob of type t into the repository. If id is the null id, it
-// will be computed and returned.
-func (r *Repository) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID) (restic.ID, error) {
-	var i *restic.ID
-	if !id.IsNull() {
-		i = &id
+// SaveBlob saves a blob of type t into the repository.
+// It takes care that no duplicates are saved; this can be overwritten
+// by setting storeDuplicate to true.
+// If id is the null id, it will be computed and returned.
+// Also returns if the blob was already known before
+func (r *Repository) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (newID restic.ID, known bool, err error) {
+
+	// compute plaintext hash if not already set
+	if id.IsNull() {
+		newID = restic.Hash(buf)
+	} else {
+		newID = id
 	}
-	return r.SaveAndEncrypt(ctx, t, buf, i)
+
+	// first try to add to pending blobs; if not successful, this blob is already known
+	known = !r.idx.addPending(newID, t)
+
+	// only save when needed or explicitly told
+	if !known || storeDuplicate {
+		err = r.SaveAndEncrypt(ctx, t, buf, newID)
+	}
+
+	return newID, known, err
 }
 
 // LoadTree loads a tree from the repository.
@@ -718,12 +755,7 @@ func (r *Repository) SaveTree(ctx context.Context, t *restic.Tree) (restic.ID, e
 	// adds a newline after each object)
 	buf = append(buf, '\n')
 
-	id := restic.Hash(buf)
-	if r.idx.Has(id, restic.TreeBlob) {
-		return id, nil
-	}
-
-	_, err = r.SaveBlob(ctx, restic.TreeBlob, buf, id)
+	id, _, err := r.SaveBlob(ctx, restic.TreeBlob, buf, restic.ID{}, false)
 	return id, err
 }
 
@@ -734,7 +766,7 @@ type Loader interface {
 
 // DownloadAndHash is all-in-one helper to download content of the file at h to a temporary filesystem location
 // and calculate ID of the contents. Returned (temporary) file is positioned at the beginning of the file;
-// it is reponsibility of the caller to close and delete the file.
+// it is the reponsibility of the caller to close and delete the file.
 func DownloadAndHash(ctx context.Context, be Loader, h restic.Handle) (tmpfile *os.File, hash restic.ID, size int64, err error) {
 	tmpfile, err = fs.TempFile("", "restic-temp-")
 	if err != nil {

@@ -64,7 +64,7 @@ func (m *S3Layout) moveFiles(ctx context.Context, be *s3.Backend, l backend.Layo
 		debug.Log("move %v", h)
 
 		return retry(maxErrors, printErr, func() error {
-			return be.Rename(h, l)
+			return be.Rename(ctx, h, l)
 		})
 	})
 }
@@ -91,7 +91,7 @@ func (m *S3Layout) Apply(ctx context.Context, repo restic.Repository) error {
 
 	for _, t := range []restic.FileType{
 		restic.SnapshotFile,
-		restic.DataFile,
+		restic.PackFile,
 		restic.KeyFile,
 		restic.LockFile,
 	} {

@@ -38,7 +38,7 @@ func runRebuildIndex(gopts GlobalOptions) error {
 		return err
 	}
 
-	lock, err := lockRepoExclusive(repo)
+	lock, err := lockRepoExclusive(gopts.ctx, repo)
 	defer unlockRepo(lock)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func rebuildIndex(ctx context.Context, repo restic.Repository, ignorePacks resti
 	Verbosef("counting files in repo\n")
 
 	var packs uint64
-	err := repo.List(ctx, restic.DataFile, func(restic.ID, int64) error {
+	err := repo.List(ctx, restic.PackFile, func(restic.ID, int64) error {
 		packs++
 		return nil
 	})
@@ -63,6 +63,7 @@ func rebuildIndex(ctx context.Context, repo restic.Repository, ignorePacks resti
 
 	bar := newProgressMax(!globalOptions.Quiet, packs-uint64(len(ignorePacks)), "packs")
 	idx, invalidFiles, err := index.New(ctx, repo, ignorePacks, bar)
+	bar.Done()
 	if err != nil {
 		return err
 	}
@@ -92,14 +93,9 @@ func rebuildIndex(ctx context.Context, repo restic.Repository, ignorePacks resti
 	Verbosef("saved new indexes as %v\n", ids)
 
 	Verbosef("remove %d old index files\n", len(supersedes))
-
-	for _, id := range supersedes {
-		if err := repo.Backend().Remove(ctx, restic.Handle{
-			Type: restic.IndexFile,
-			Name: id.String(),
-		}); err != nil {
-			Warnf("error removing old index %v: %v\n", id.Str(), err)
-		}
+	err = DeleteFilesChecked(globalOptions, repo, restic.NewIDSet(supersedes...), restic.IndexFile)
+	if err != nil {
+		return errors.Fatalf("unable to remove an old index: %v\n", err)
 	}
 
 	return nil

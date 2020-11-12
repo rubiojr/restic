@@ -3,10 +3,8 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -100,36 +98,6 @@ func stringToIntSlice(param string) (split []uint, err error) {
 	return result, nil
 }
 
-func newReadProgress(gopts GlobalOptions, todo restic.Stat) *restic.Progress {
-	if gopts.Quiet {
-		return nil
-	}
-
-	readProgress := restic.NewProgress()
-
-	readProgress.OnUpdate = func(s restic.Stat, d time.Duration, ticker bool) {
-		status := fmt.Sprintf("[%s] %s  %d / %d items",
-			formatDuration(d),
-			formatPercent(s.Blobs, todo.Blobs),
-			s.Blobs, todo.Blobs)
-
-		if w := stdoutTerminalWidth(); w > 0 {
-			if len(status) > w {
-				max := w - len(status) - 4
-				status = status[:max] + "... "
-			}
-		}
-
-		PrintProgress("%s", status)
-	}
-
-	readProgress.OnDone = func(s restic.Stat, d time.Duration, ticker bool) {
-		fmt.Printf("\nduration: %s\n", formatDuration(d))
-	}
-
-	return readProgress
-}
-
 // prepareCheckCache configures a special cache directory for check.
 //
 //  * if --with-cache is specified, the default cache is used
@@ -174,7 +142,7 @@ func prepareCheckCache(opts CheckOptions, gopts *GlobalOptions) (cleanup func())
 
 func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 	if len(args) != 0 {
-		return errors.Fatal("check has no arguments")
+		return errors.Fatal("the check command expects no arguments, only options - please see `restic help check` for usage and flags")
 	}
 
 	cleanup := prepareCheckCache(opts, &gopts)
@@ -190,7 +158,7 @@ func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 
 	if !gopts.NoLock {
 		Verbosef("create exclusive lock for repository\n")
-		lock, err := lockRepoExclusive(repo)
+		lock, err := lockRepoExclusive(gopts.ctx, repo)
 		defer unlockRepo(lock)
 		if err != nil {
 			return err
@@ -235,7 +203,7 @@ func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 			continue
 		}
 		errorsFound = true
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		Warnf("%v\n", err)
 	}
 
 	if orphanedPacks > 0 {
@@ -249,18 +217,18 @@ func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 	for err := range errChan {
 		errorsFound = true
 		if e, ok := err.(checker.TreeError); ok {
-			fmt.Fprintf(os.Stderr, "error for tree %v:\n", e.ID.Str())
+			Warnf("error for tree %v:\n", e.ID.Str())
 			for _, treeErr := range e.Errors {
-				fmt.Fprintf(os.Stderr, "  %v\n", treeErr)
+				Warnf("  %v\n", treeErr)
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			Warnf("error: %v\n", err)
 		}
 	}
 
 	if opts.CheckUnused {
 		for _, id := range chkr.UnusedBlobs() {
-			Verbosef("unused blob %v\n", id.Str())
+			Verbosef("unused blob %v\n", id)
 			errorsFound = true
 		}
 	}
@@ -282,15 +250,16 @@ func runCheck(opts CheckOptions, gopts GlobalOptions, args []string) error {
 			Verbosef("read all data\n")
 		}
 
-		p := newReadProgress(gopts, restic.Stat{Blobs: packCount})
+		p := newProgressMax(!gopts.Quiet, packCount, "packs")
 		errChan := make(chan error)
 
 		go chkr.ReadPacks(gopts.ctx, packs, p, errChan)
 
 		for err := range errChan {
 			errorsFound = true
-			fmt.Fprintf(os.Stderr, "%v\n", err)
+			Warnf("%v\n", err)
 		}
+		p.Done()
 	}
 
 	switch {

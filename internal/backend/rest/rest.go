@@ -63,13 +63,13 @@ func Open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 }
 
 // Create creates a new REST on server configured in config.
-func Create(cfg Config, rt http.RoundTripper) (*Backend, error) {
+func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (*Backend, error) {
 	be, err := Open(cfg, rt)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = be.Stat(context.TODO(), restic.Handle{Type: restic.ConfigFile})
+	_, err = be.Stat(ctx, restic.Handle{Type: restic.ConfigFile})
 	if err == nil {
 		return nil, errors.Fatal("config file already exists")
 	}
@@ -173,7 +173,32 @@ func (b *Backend) IsNotExist(err error) bool {
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
 func (b *Backend) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
-	return backend.DefaultLoad(ctx, h, length, offset, b.openReader, fn)
+	r, err := b.openReader(ctx, h, length, offset)
+	if err != nil {
+		return err
+	}
+	err = fn(r)
+	if err != nil {
+		_ = r.Close() // ignore error here
+		return err
+	}
+
+	// Note: readerat.ReadAt() (the fn) uses io.ReadFull() that doesn't
+	// wait for EOF after reading body. Due to HTTP/2 stream multiplexing
+	// and goroutine timings the EOF frame arrives from server (eg. rclone)
+	// with a delay after reading body. Immediate close might trigger
+	// HTTP/2 stream reset resulting in the *stream closed* error on server,
+	// so we wait for EOF before closing body.
+	var buf [1]byte
+	_, err = r.Read(buf[:])
+	if err == io.EOF {
+		err = nil
+	}
+
+	if e := r.Close(); err == nil {
+		err = e
+	}
+	return err
 }
 
 func (b *Backend) openReader(ctx context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
@@ -442,7 +467,7 @@ func (b *Backend) removeKeys(ctx context.Context, t restic.FileType) error {
 // Delete removes all data in the backend.
 func (b *Backend) Delete(ctx context.Context) error {
 	alltypes := []restic.FileType{
-		restic.DataFile,
+		restic.PackFile,
 		restic.KeyFile,
 		restic.LockFile,
 		restic.SnapshotFile,
